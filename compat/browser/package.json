@@ -9,6 +9,7 @@
   "dependencies": {
     "esbuild": "0.25.12",
     "firebase": "10.14.1",
+    "firebase-admin": "12.7.0",
     "puppeteer": "23.11.1"
   }
 }

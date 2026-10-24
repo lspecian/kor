@@ -103,7 +103,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// cors lets the web app call Kor from its own origin. Credentials are
+// cors lets web apps call Kor from their own origin. Credentials are
 // allowed, so the origin is echoed rather than wildcarded.
 func cors(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()

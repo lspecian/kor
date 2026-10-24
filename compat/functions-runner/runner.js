@@ -247,7 +247,7 @@ async function pump(cursor) {
 const express = fromFunctions('express');
 const app = express();
 app.use(express.json({ limit: '10mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
-// Web apps probe the root cross-origin to see whether the emulator is up;
+// Web apps may probe the root cross-origin to see whether the emulator is up;
 // functions answer CORS themselves (onCall, or onRequest's cors option).
 app.get('/', (_req, res) => res.set('Access-Control-Allow-Origin', '*').send('ok'));
 app.all('/:project/:region/:name', (req, res) => {
