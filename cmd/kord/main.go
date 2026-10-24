@@ -6,6 +6,8 @@
 //	FIRESTORE_EMULATOR_HOST=localhost:6565 ./your-app
 package main
 
+// Modified in this fork: -backend selects PostgreSQL or Cosmos DB storage.
+
 import (
 	"context"
 	"flag"
@@ -19,6 +21,8 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/omelas-tech/kor/internal/backend"
+	"github.com/omelas-tech/kor/internal/cosmos"
 	"github.com/omelas-tech/kor/internal/rpc"
 	"github.com/omelas-tech/kor/internal/store"
 )
@@ -30,7 +34,13 @@ const indexReloadInterval = 30 * time.Second
 
 func main() {
 	listen := flag.String("listen", envOr("KORD_LISTEN", "127.0.0.1:6565"), "address to serve gRPC on")
-	dsn := flag.String("pg-dsn", os.Getenv("KORD_PG_DSN"), "PostgreSQL DSN (required)")
+	backendName := flag.String("backend", envOr("KORD_BACKEND", "postgres"), "storage backend: postgres|cosmos")
+	dsn := flag.String("pg-dsn", os.Getenv("KORD_PG_DSN"), "PostgreSQL DSN (required for -backend postgres)")
+	cosmosEndpoint := flag.String("cosmos-endpoint", os.Getenv("KORD_COSMOS_ENDPOINT"), "Cosmos DB account endpoint (-backend cosmos)")
+	cosmosDatabase := flag.String("cosmos-database", envOr("KORD_COSMOS_DATABASE", "kor"), "Cosmos DB database")
+	cosmosContainer := flag.String("cosmos-container", envOr("KORD_COSMOS_CONTAINER", "documents"), "Cosmos DB container, partitioned on /customer_id")
+	customerID := flag.String("customer-id", os.Getenv("KORD_CUSTOMER_ID"), "partition value for every document (-backend cosmos)")
+	cosmosCreate := flag.Bool("cosmos-create", envOr("KORD_COSMOS_CREATE", "") != "", "create the Cosmos database and container if missing (local use)")
 	logLevel := flag.String("log", envOr("KORD_LOG", "info"), "log level: debug|info|warn|error")
 	metricsAddr := flag.String("metrics", envOr("KORD_METRICS", "127.0.0.1:6566"), "Prometheus /metrics address (empty = disabled)")
 	allowPublic := flag.Bool("i-know-this-is-unauthenticated", envOr("KORD_ALLOW_PUBLIC_BIND", "") != "",
@@ -42,8 +52,19 @@ func main() {
 		level = slog.LevelInfo
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-	if *dsn == "" {
-		log.Error("missing -pg-dsn / KORD_PG_DSN")
+	switch *backendName {
+	case "postgres":
+		if *dsn == "" {
+			log.Error("missing -pg-dsn / KORD_PG_DSN")
+			os.Exit(2)
+		}
+	case "cosmos":
+		if *cosmosEndpoint == "" || os.Getenv("KORD_COSMOS_KEY") == "" || *customerID == "" {
+			log.Error("-backend cosmos needs -cosmos-endpoint, KORD_COSMOS_KEY and -customer-id")
+			os.Exit(2)
+		}
+	default:
+		log.Error("unknown -backend", "backend", *backendName)
 		os.Exit(2)
 	}
 
@@ -72,41 +93,34 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, *dsn)
-	if err != nil {
-		log.Error("open store", "err", err)
-		os.Exit(1)
-	}
-	defer st.Close()
-
-	// Composite index definitions live in Postgres, so the CLI can register and
-	// backfill them against a running server. Reloading on a ticker rather than
-	// only at boot means enabling an index does not require a restart — and,
-	// more importantly, that a backfill finishing elsewhere takes effect on its
-	// own, instead of leaving an index that is complete in the database but
-	// still considered pending here.
-	//
-	// A failure to load is logged, not fatal: indexes are an optimisation, and
-	// the general query path serves every query correctly without them.
-	if n, err := st.LoadIndexes(ctx); err != nil {
-		log.Warn("loading composite indexes", "err", err, "ready", n)
-	} else if n > 0 {
-		log.Info("composite indexes loaded", "ready", n)
-	}
-	go func() {
-		t := time.NewTicker(indexReloadInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if _, err := st.LoadIndexes(ctx); err != nil {
-					log.Warn("reloading composite indexes", "err", err)
-				}
-			}
+	var be backend.Backend
+	switch *backendName {
+	case "cosmos":
+		cs, err := cosmos.Open(ctx, cosmos.Config{
+			Endpoint:        *cosmosEndpoint,
+			Key:             os.Getenv("KORD_COSMOS_KEY"),
+			Database:        *cosmosDatabase,
+			Container:       *cosmosContainer,
+			CustomerID:      *customerID,
+			CreateIfMissing: *cosmosCreate,
+		})
+		if err != nil {
+			log.Error("open cosmos backend", "err", err)
+			os.Exit(1)
 		}
-	}()
+		defer cs.Close()
+		be = cs
+		log.Info("backend", "kind", "cosmos", "database", *cosmosDatabase, "container", *cosmosContainer)
+	default:
+		st, err := store.Open(ctx, *dsn)
+		if err != nil {
+			log.Error("open store", "err", err)
+			os.Exit(1)
+		}
+		defer st.Close()
+		be = st
+		startIndexLoader(ctx, log, st)
+	}
 
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -118,7 +132,7 @@ func main() {
 		grpc.UnaryInterceptor(rpc.UnaryLogging(log)),
 		grpc.StreamInterceptor(rpc.StreamLogging(log)),
 	)
-	rpc.New(st).Register(g)
+	rpc.New(be).Register(g)
 	rpc.StartStatsReporter(ctx, log, time.Minute)
 	if *metricsAddr != "" {
 		metricsSrv := rpc.ServeMetrics(*metricsAddr)
@@ -185,4 +199,33 @@ func isLoopbackHost(host string) bool {
 		}
 	}
 	return true
+}
+
+// startIndexLoader loads composite index definitions from Postgres and keeps
+// reloading them, so the CLI can register and backfill indexes against a
+// running server. Reloading on a ticker rather than only at boot means
+// enabling an index does not require a restart, and a backfill finishing
+// elsewhere takes effect on its own. A failure to load is logged, not fatal:
+// indexes are an optimisation, and the general query path serves every query
+// correctly without them.
+func startIndexLoader(ctx context.Context, log *slog.Logger, st *store.Store) {
+	if n, err := st.LoadIndexes(ctx); err != nil {
+		log.Warn("loading composite indexes", "err", err, "ready", n)
+	} else if n > 0 {
+		log.Info("composite indexes loaded", "ready", n)
+	}
+	go func() {
+		t := time.NewTicker(indexReloadInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if _, err := st.LoadIndexes(ctx); err != nil {
+					log.Warn("reloading composite indexes", "err", err)
+				}
+			}
+		}
+	}()
 }
