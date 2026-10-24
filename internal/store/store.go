@@ -316,7 +316,7 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			if err := s.refreshIndexEntries(ctx, tx, name, p.CollectionID, st.Fields, false); err != nil {
 				return nil, time.Time{}, err
 			}
-			if err := appendChange(ctx, tx, name, p.CollectionID, "write"); err != nil {
+			if err := appendChangeImages(ctx, tx, name, p.CollectionID, "write", existing[name], afterDoc(st)); err != nil {
 				return nil, time.Time{}, err
 			}
 		} else {
@@ -326,7 +326,7 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			if err := s.refreshIndexEntries(ctx, tx, name, paths[name].CollectionID, nil, true); err != nil {
 				return nil, time.Time{}, err
 			}
-			if err := appendChange(ctx, tx, name, paths[name].CollectionID, "delete"); err != nil {
+			if err := appendChangeImages(ctx, tx, name, paths[name].CollectionID, "delete", existing[name], nil); err != nil {
 				return nil, time.Time{}, err
 			}
 		}

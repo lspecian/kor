@@ -34,7 +34,9 @@ type Options struct {
 	// Extra handles routes owned by other packages (sign-in bridge, events);
 	// it returns false when the route is not its own.
 	Extra []func(w http.ResponseWriter, r *http.Request) bool
-	Log   *slog.Logger
+	// Events serves /kor/v1/events when it implements backend.EventLog.
+	Events any
+	Log    *slog.Logger
 }
 
 // Server is the HTTP front of a Kor service.
@@ -91,6 +93,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveREST(w, r)
 	case s.opts.Emulator && strings.HasPrefix(p, "/emulator/v1/projects/"):
 		s.serveEmulator(w, r)
+	case p == "/kor/v1/events" && r.Method == http.MethodGet:
+		s.serveEvents(w, r)
 	case p == "/" && r.Method == http.MethodGet:
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = io.WriteString(w, "Ok\n")

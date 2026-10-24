@@ -67,7 +67,7 @@ func (s *Store) changelogHead(ctx context.Context) (Cursor, error) {
 	err := s.Pool.QueryRow(ctx, `
 		SELECT xid::text, seq FROM changelog
 		WHERE xid < pg_snapshot_xmin(pg_current_snapshot())
-		ORDER BY xid DESC, seq DESC LIMIT 1`).Scan(&xid, &seq)
+		ORDER BY changelog.xid DESC, changelog.seq DESC LIMIT 1`).Scan(&xid, &seq)
 	if err == pgx.ErrNoRows {
 		return Cursor{}, nil
 	}
@@ -97,9 +97,10 @@ func (s *Store) ClearDatabase(ctx context.Context, database string) error {
 		args []any
 	}{
 		{`DELETE FROM index_entries WHERE doc_name >= $1 AND doc_name < $2`, []any{lo, hi}},
-		{`WITH gone AS (DELETE FROM documents WHERE name >= $1 AND name < $2 RETURNING name, collection_id)
-		 INSERT INTO changelog (xid, doc_name, collection_id, kind)
-		 SELECT pg_current_xact_id(), name, collection_id, 'delete' FROM gone`, []any{lo, hi}},
+		{`WITH gone AS (DELETE FROM documents WHERE name >= $1 AND name < $2
+		               RETURNING name, collection_id, data, create_time, update_time)
+		 INSERT INTO changelog (xid, doc_name, collection_id, kind, before_data, before_create, before_update)
+		 SELECT pg_current_xact_id(), name, collection_id, 'delete', data, create_time, update_time FROM gone`, []any{lo, hi}},
 		{`DELETE FROM collections WHERE parent_path >= $1 AND parent_path < $2`, []any{database + "/documents", hi}},
 	}
 	for _, st := range stmts {

@@ -173,7 +173,7 @@ func main() {
 		}
 		log.Info("security rules loaded", "file", *rulesFile)
 	}
-	opts := web.Options{Emulator: *emulatorMode, Log: log, LoadRules: rpcSrv.SetProjectRules}
+	opts := web.Options{Emulator: *emulatorMode, Log: log, LoadRules: rpcSrv.SetProjectRules, Events: be}
 	if *identityProject != "" {
 		key, err := loadOrCreateKey(*identityKey)
 		if err != nil {

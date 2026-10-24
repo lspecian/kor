@@ -337,7 +337,20 @@ func (s *Store) tryCommit(ctx context.Context, ws []*pb.Write, verify map[string
 		if !st.Dirty {
 			continue
 		}
-		changes = append(changes, changeEntry{Name: name, CollectionID: paths[name].CollectionID, Delete: !st.Exists})
+		entry := changeEntry{Name: name, CollectionID: paths[name].CollectionID, Delete: !st.Exists}
+		var err error
+		if cur := seen[name]; cur != nil {
+			if entry.Before, err = imageOf(cur.doc); err != nil {
+				return nil, time.Time{}, err
+			}
+		}
+		if st.Exists {
+			after := &backend.Doc{Name: name, Fields: st.Fields, CreateTime: st.CreateTime, UpdateTime: st.UpdateTime}
+			if entry.After, err = imageOf(after); err != nil {
+				return nil, time.Time{}, err
+			}
+		}
+		changes = append(changes, entry)
 		cur := seen[name]
 		if st.Exists {
 			body, err := s.encode(paths[name], st)
@@ -443,11 +456,42 @@ func (s *Store) encode(p backend.DocPath, st *writes.DocState) ([]byte, error) {
 	})
 }
 
-// changeEntry is one document event inside a change record.
+// changeEntry is one document event inside a change record, with the
+// document's state before and after the commit for event handlers.
 type changeEntry struct {
-	Name         string `json:"name"`
-	CollectionID string `json:"collection_id"`
-	Delete       bool   `json:"delete,omitempty"`
+	Name         string    `json:"name"`
+	CollectionID string    `json:"collection_id"`
+	Delete       bool      `json:"delete,omitempty"`
+	Before       *docImage `json:"before,omitempty"`
+	After        *docImage `json:"after,omitempty"`
+}
+
+type docImage struct {
+	Data     json.RawMessage `json:"data"`
+	CreateUS int64           `json:"create_us"`
+	UpdateUS int64           `json:"update_us"`
+}
+
+func imageOf(d *backend.Doc) (*docImage, error) {
+	if d == nil {
+		return nil, nil
+	}
+	data, err := value.MarshalFields(d.Fields)
+	if err != nil {
+		return nil, err
+	}
+	return &docImage{Data: data, CreateUS: d.CreateTime.UnixMicro(), UpdateUS: d.UpdateTime.UnixMicro()}, nil
+}
+
+func (im *docImage) doc(name string) (*backend.Doc, error) {
+	if im == nil {
+		return nil, nil
+	}
+	fields, err := value.UnmarshalFields(im.Data)
+	if err != nil {
+		return nil, err
+	}
+	return &backend.Doc{Name: name, Fields: fields, CreateTime: toTime(im.CreateUS), UpdateTime: toTime(im.UpdateUS)}, nil
 }
 
 // changeItem records which documents one commit wrote or deleted.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
@@ -134,4 +135,62 @@ func (s *Store) ClearDatabase(ctx context.Context, database string) error {
 		return fmt.Errorf("cosmos: clear: record deletes: %w", err)
 	}
 	return nil
+}
+
+var _ backend.EventLog = (*Store)(nil)
+
+// ReadEvents returns the events in change records after the cursor (a commit
+// time in microseconds). Each read re-covers the lookback window, so a
+// commit that landed late is not missed; consumers de-duplicate by ID.
+func (s *Store) ReadEvents(ctx context.Context, cursor string, limit int) ([]backend.Event, string, error) {
+	if cursor == "" {
+		return nil, strconv.FormatInt(time.Now().UnixMicro(), 10), nil
+	}
+	at, err := strconv.ParseInt(cursor, 10, 64)
+	if err != nil {
+		return nil, "", fmt.Errorf("cosmos: bad event cursor %q", cursor)
+	}
+	since := at - watchLookback.Microseconds()
+	pager := s.container.NewQueryItemsPager(`SELECT * FROM c WHERE c.kind = "change" AND c.at_us > @since`, s.pk,
+		&azcosmos.QueryOptions{QueryParameters: []azcosmos.QueryParameter{{Name: "@since", Value: since}}})
+	var records []changeItem
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("cosmos: read events: %w", err)
+		}
+		for _, raw := range page.Items {
+			var it changeItem
+			if err := json.Unmarshal(raw, &it); err != nil {
+				return nil, "", fmt.Errorf("cosmos: bad change record: %w", err)
+			}
+			records = append(records, it)
+		}
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].AtUS < records[j].AtUS })
+	next := at
+	var out []backend.Event
+	for _, rec := range records {
+		if limit > 0 && len(out) >= limit && rec.AtUS > next {
+			break
+		}
+		if rec.AtUS > next {
+			next = rec.AtUS
+		}
+		for i, c := range rec.Changes {
+			before, err := c.Before.doc(c.Name)
+			if err != nil {
+				return nil, "", err
+			}
+			after, err := c.After.doc(c.Name)
+			if err != nil {
+				return nil, "", err
+			}
+			out = append(out, backend.Event{
+				ID: fmt.Sprintf("cosmos:%s:%d", rec.ID, i), Name: c.Name, CollectionID: c.CollectionID,
+				Before: before, After: after, CommitTime: toTime(rec.AtUS),
+			})
+		}
+	}
+	return out, strconv.FormatInt(next, 10), nil
 }

@@ -1,3 +1,6 @@
+// Modified in this fork: Changes orders by the xid8 column, not its text
+// rendering (which sorted "999" after "1000" and could skip events).
+
 package store
 
 import (
@@ -71,7 +74,7 @@ func (s *Store) Changes(ctx context.Context, after Cursor, collectionID string, 
 	rows, err := s.Pool.Query(ctx, `
 		SELECT seq, xid::text, doc_name, collection_id, kind, at
 		FROM changelog `+where+`
-		ORDER BY xid, seq LIMIT $3`, args...)
+		ORDER BY changelog.xid, changelog.seq LIMIT $3`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: read changelog: %w", err)
 	}
