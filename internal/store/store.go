@@ -1,4 +1,7 @@
 // Package store is Kor's PostgreSQL persistence layer.
+//
+// Modified in this fork: Doc moved to package backend, Store implements
+// backend.Backend, and ListCollectionIDs moved here from the RPC layer.
 package store
 
 import (
@@ -16,9 +19,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/omelas-tech/kor/internal/backend"
 	"github.com/omelas-tech/kor/internal/value"
 	"github.com/omelas-tech/kor/internal/writes"
 )
+
+var _ backend.Backend = (*Store)(nil)
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
@@ -41,12 +47,7 @@ type Store struct {
 }
 
 // Doc is a stored document.
-type Doc struct {
-	Name       string
-	Fields     map[string]*pb.Value
-	CreateTime time.Time
-	UpdateTime time.Time
-}
+type Doc = backend.Doc
 
 // Open connects, applies migrations, and returns the store.
 func Open(ctx context.Context, dsn string) (*Store, error) {
@@ -67,6 +68,26 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 }
 
 func (s *Store) Close() { s.Pool.Close() }
+
+// ListCollectionIDs lists the collection ids directly under parent, from the
+// registry maintained on write.
+func (s *Store) ListCollectionIDs(ctx context.Context, parent string) ([]string, error) {
+	rows, err := s.Pool.Query(ctx,
+		`SELECT collection_id FROM collections WHERE parent_path = $1 ORDER BY collection_id`, parent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
 
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.Pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (

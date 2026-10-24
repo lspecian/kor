@@ -1,6 +1,9 @@
 // Package rpc implements the google.firestore.v1.Firestore gRPC service on
-// top of Kor's store. Firestore SDKs connect to it via
+// top of a storage backend. Firestore SDKs connect to it via
 // FIRESTORE_EMULATOR_HOST or a custom host setting — no application changes.
+//
+// Modified in this fork: the service depends on backend.Backend instead of the
+// PostgreSQL store, and no longer queries the database directly.
 package rpc
 
 import (
@@ -15,19 +18,19 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/omelas-tech/kor/internal/backend"
 	"github.com/omelas-tech/kor/internal/query"
-	"github.com/omelas-tech/kor/internal/store"
 )
 
 // Server implements pb.FirestoreServer.
 type Server struct {
 	pb.UnimplementedFirestoreServer
-	store *store.Store
+	store backend.Backend
 }
 
-// New returns a Firestore service backed by st.
-func New(st *store.Store) *Server {
-	return &Server{store: st}
+// New returns a Firestore service backed by b.
+func New(b backend.Backend) *Server {
+	return &Server{store: b}
 }
 
 // Register attaches the service to a gRPC server.
@@ -80,7 +83,7 @@ func (s *Server) RunQuery(req *pb.RunQueryRequest, stream pb.Firestore_RunQueryS
 	}
 	readTime := timestamppb.New(time.Now().UTC().Truncate(time.Microsecond))
 	sent := 0
-	err = s.store.RunQuery(stream.Context(), q, func(doc *store.Doc) error {
+	err = s.store.RunQuery(stream.Context(), q, func(doc *backend.Doc) error {
 		d, err := docProto(doc)
 		if err != nil {
 			return err
@@ -241,24 +244,14 @@ func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.F
 // ListCollectionIds lists the collection ids under a parent, from the
 // registry maintained on write.
 func (s *Server) ListCollectionIds(ctx context.Context, req *pb.ListCollectionIdsRequest) (*pb.ListCollectionIdsResponse, error) {
-	rows, err := s.store.Pool.Query(ctx,
-		`SELECT collection_id FROM collections WHERE parent_path = $1 ORDER BY collection_id`, req.GetParent())
+	ids, err := s.store.ListCollectionIDs(ctx, req.GetParent())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var resp pb.ListCollectionIdsResponse
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		resp.CollectionIds = append(resp.CollectionIds, id)
-	}
-	return &resp, rows.Err()
+	return &pb.ListCollectionIdsResponse{CollectionIds: ids}, nil
 }
 
-func docProto(doc *store.Doc) (*pb.Document, error) {
+func docProto(doc *backend.Doc) (*pb.Document, error) {
 	fields := doc.Fields
 	if fields == nil {
 		fields = map[string]*pb.Value{}
