@@ -60,6 +60,7 @@ func main() {
 	identityProject := flag.String("identity-project", os.Getenv("KORD_IDENTITY_PROJECT"), "serve the Firebase Auth sign-in bridge for this project")
 	identityKey := flag.String("identity-key", os.Getenv("KORD_IDENTITY_KEY"), "PEM file holding the bridge's signing key (created if missing)")
 	trustCustomTokens := flag.Bool("identity-trust-unsigned-custom-tokens", envOr("KORD_IDENTITY_TRUST_UNSIGNED_CUSTOM_TOKENS", "") != "", "accept custom tokens without verifying them, as the Auth emulator does (development only)")
+	emulatorTokens := flag.Bool("identity-emulator-tokens", envOr("KORD_IDENTITY_EMULATOR_TOKENS", "") != "", "issue unsigned ID tokens like the Firebase Auth emulator, for Admin SDKs in emulator mode (development only; needs -allow-unsigned-tokens)")
 	extraListen := flag.String("extra-listen", os.Getenv("KORD_EXTRA_LISTEN"), "comma-separated extra addresses serving the same endpoints (e.g. the Auth emulator port)")
 	rulesFile := flag.String("rules", os.Getenv("KORD_RULES"), "Firestore security rules file applied to end-user requests (needs -auth)")
 	emulatorMode := flag.Bool("emulator", envOr("KORD_EMULATOR", "") != "", "serve the Firebase-emulator development endpoints (load rules, clear data)")
@@ -180,12 +181,17 @@ func main() {
 			log.Error("identity key", "file", *identityKey, "err", err)
 			os.Exit(2)
 		}
+		if *emulatorTokens && !*allowUnsigned {
+			log.Error("-identity-emulator-tokens needs -allow-unsigned-tokens, or Kor would refuse its own tokens")
+			os.Exit(2)
+		}
 		var exchange *auth.Verifier
 		if *oidcIssuer != "" {
 			exchange = auth.NewVerifier(authConfig(false, "", false, "", *oidcIssuer, *oidcAudience, *oidcJWKS))
 		}
 		bridge, err := identity.New(identity.Config{
-			Project: *identityProject, Key: key, TrustUnsignedCustomTokens: *trustCustomTokens, Exchange: exchange, Log: log,
+			Project: *identityProject, Key: key, TrustUnsignedCustomTokens: *trustCustomTokens, Exchange: exchange,
+			EmulatorTokens: *emulatorTokens, Admins: verifier, Log: log,
 		}, be)
 		if err != nil {
 			log.Error("identity bridge", "err", err)
