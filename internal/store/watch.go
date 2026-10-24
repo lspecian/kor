@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -93,19 +92,18 @@ func (s *Store) ClearDatabase(ctx context.Context, database string) error {
 		return fmt.Errorf("store: clear: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	stmts := []string{
-		`DELETE FROM index_entries WHERE doc_name >= $1 AND doc_name < $2`,
-		`WITH gone AS (DELETE FROM documents WHERE name >= $1 AND name < $2 RETURNING name, collection_id)
+	stmts := []struct {
+		sql  string
+		args []any
+	}{
+		{`DELETE FROM index_entries WHERE doc_name >= $1 AND doc_name < $2`, []any{lo, hi}},
+		{`WITH gone AS (DELETE FROM documents WHERE name >= $1 AND name < $2 RETURNING name, collection_id)
 		 INSERT INTO changelog (xid, doc_name, collection_id, kind)
-		 SELECT pg_current_xact_id(), name, collection_id, 'delete' FROM gone`,
-		`DELETE FROM collections WHERE parent_path >= $3 AND parent_path < $2`,
+		 SELECT pg_current_xact_id(), name, collection_id, 'delete' FROM gone`, []any{lo, hi}},
+		{`DELETE FROM collections WHERE parent_path >= $1 AND parent_path < $2`, []any{database + "/documents", hi}},
 	}
-	for _, q := range stmts {
-		args := []any{lo, hi}
-		if strings.Contains(q, "$3") {
-			args = append(args, database+"/documents")
-		}
-		if _, err := tx.Exec(ctx, q, args...); err != nil {
+	for _, st := range stmts {
+		if _, err := tx.Exec(ctx, st.sql, st.args...); err != nil {
 			return fmt.Errorf("store: clear: %w", err)
 		}
 	}

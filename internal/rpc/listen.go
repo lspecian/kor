@@ -279,6 +279,9 @@ func (l *listener) handle(ctx context.Context, req *pb.ListenRequest) error {
 		}
 	}
 	results, err := l.evaluate(ctx, t)
+	if status.Code(err) == codes.PermissionDenied {
+		return l.reject(t.id, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -323,6 +326,14 @@ func (l *listener) onChanges(ctx context.Context, changes []backend.Change, resy
 			continue
 		}
 		next, err := l.evaluate(ctx, t)
+		if status.Code(err) == codes.PermissionDenied {
+			delete(l.targets, t.id)
+			if err := l.reject(t.id, err); err != nil {
+				return err
+			}
+			sent = true
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -356,17 +367,36 @@ func (l *listener) onChanges(ctx context.Context, changes []backend.Change, resy
 func (l *listener) evaluate(ctx context.Context, t *target) (map[string]*backend.Doc, error) {
 	out := map[string]*backend.Doc{}
 	if t.query != nil {
-		err := l.server.store.RunQuery(ctx, t.query, func(doc *backend.Doc) error {
-			out[doc.Name] = doc
+		var docs []*backend.Doc
+		if err := l.server.store.RunQuery(ctx, t.query, func(doc *backend.Doc) error {
+			docs = append(docs, doc)
 			return nil
-		})
-		return out, err
+		}); err != nil {
+			return nil, err
+		}
+		if err := l.server.checkQueryRule(ctx, t.query); err != nil {
+			return nil, err
+		}
+		if err := l.server.checkList(ctx, docs); err != nil {
+			return nil, err
+		}
+		for _, d := range docs {
+			out[d.Name] = d
+		}
+		return out, nil
 	}
 	names := make([]string, 0, len(t.names))
 	for name := range t.names {
 		names = append(names, name)
 	}
-	return l.server.store.GetDocuments(ctx, names)
+	docs, err := l.server.store.GetDocuments(ctx, names)
+	if err != nil {
+		return nil, err
+	}
+	if err := l.server.checkGet(ctx, names, docs); err != nil {
+		return nil, err
+	}
+	return docs, nil
 }
 
 func (l *listener) sendDoc(doc *backend.Doc, targetID int32) error {

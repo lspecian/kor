@@ -294,7 +294,7 @@ func (s *Store) tryCommit(ctx context.Context, ws []*pb.Write, verify map[string
 	for _, name := range targets {
 		if cur := seen[name]; cur != nil {
 			states[name] = &writes.DocState{
-				Name: name, Exists: true, Fields: cur.doc.Fields,
+				Name: name, Exists: true, Fields: backend.CloneFields(cur.doc.Fields),
 				CreateTime: cur.doc.CreateTime, UpdateTime: cur.doc.UpdateTime,
 			}
 		} else {
@@ -309,6 +309,24 @@ func (s *Store) tryCommit(ctx context.Context, ws []*pb.Write, verify map[string
 			return nil, time.Time{}, err
 		}
 		results = append(results, res)
+	}
+
+	for _, name := range targets {
+		st := states[name]
+		if !st.Dirty {
+			continue
+		}
+		var before *backend.Doc
+		if cur := seen[name]; cur != nil {
+			before = cur.doc
+		}
+		var after *backend.Doc
+		if st.Exists {
+			after = &backend.Doc{Name: name, Fields: st.Fields, CreateTime: st.CreateTime, UpdateTime: st.UpdateTime}
+		}
+		if err := backend.RunCommitCheck(ctx, name, before, after); err != nil {
+			return nil, time.Time{}, err
+		}
 	}
 
 	batch := s.container.NewTransactionalBatch(s.pk)

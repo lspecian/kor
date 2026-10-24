@@ -172,6 +172,10 @@ func (v *Verifier) verifyJWT(ctx context.Context, token string) (*verified, erro
 		if !v.cfg.AllowUnsigned {
 			return nil, errors.New("unsigned tokens are not accepted")
 		}
+		// Emulator tooling mints these with fixed 1970 times (iat 0, exp
+		// 3600), and the Firebase emulator ignores them; so do we.
+		delete(claims, "exp")
+		delete(claims, "nbf")
 		return checkClaims(claims, nil)
 	case "RS256":
 		issuer := v.issuer(iss)

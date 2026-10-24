@@ -27,6 +27,7 @@ type Server struct {
 	pb.UnimplementedFirestoreServer
 	store backend.Backend
 	hub   *hub // nil when the backend has no change feed
+	rules rulesRegistry
 }
 
 // New returns a Firestore service backed by b. Live updates are served when b
@@ -52,6 +53,7 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 		commitTime time.Time
 		err        error
 	)
+	ctx = s.withWriteChecks(ctx)
 	if txn := req.GetTransaction(); len(txn) > 0 {
 		results, commitTime, err = s.store.CommitTxn(ctx, txn, req.GetWrites())
 	} else {
@@ -88,18 +90,30 @@ func (s *Server) RunQuery(req *pb.RunQueryRequest, stream pb.Firestore_RunQueryS
 		return err
 	}
 	readTime := timestamppb.New(time.Now().UTC().Truncate(time.Microsecond))
+	var docs []*backend.Doc
+	if err := s.store.RunQuery(stream.Context(), q, func(doc *backend.Doc) error {
+		docs = append(docs, doc)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := s.checkQueryRule(stream.Context(), q); err != nil {
+		return err
+	}
+	if err := s.checkList(stream.Context(), docs); err != nil {
+		return err
+	}
 	sent := 0
-	err = s.store.RunQuery(stream.Context(), q, func(doc *backend.Doc) error {
+	for _, doc := range docs {
 		d, err := docProto(doc)
 		if err != nil {
 			return err
 		}
 		d.Fields = q.ApplyProjection(d.Fields)
 		sent++
-		return stream.Send(&pb.RunQueryResponse{Document: d, ReadTime: readTime})
-	})
-	if err != nil {
-		return err
+		if err := stream.Send(&pb.RunQueryResponse{Document: d, ReadTime: readTime}); err != nil {
+			return err
+		}
 	}
 	if sent == 0 {
 		// Empty result: a document-less response carries the read time.
@@ -133,6 +147,9 @@ func (s *Server) RunAggregationQuery(req *pb.RunAggregationQueryRequest, stream 
 			}
 		}
 	}
+	if err := s.checkQuery(stream.Context(), q); err != nil {
+		return err
+	}
 	n, err := s.store.RunCount(stream.Context(), q, upTo)
 	if err != nil {
 		return err
@@ -152,6 +169,7 @@ func (s *Server) RunAggregationQuery(req *pb.RunAggregationQueryRequest, stream 
 // per-entry rather than failing the RPC.
 func (s *Server) BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb.BatchWriteResponse, error) {
 	resp := &pb.BatchWriteResponse{}
+	ctx = s.withWriteChecks(ctx)
 	for _, w := range req.GetWrites() {
 		results, _, err := s.store.Commit(ctx, []*pb.Write{w})
 		if err != nil {
@@ -173,6 +191,9 @@ func (s *Server) GetDocument(ctx context.Context, req *pb.GetDocumentRequest) (*
 	}
 	docs, err := s.store.GetDocuments(ctx, []string{req.GetName()})
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkGet(ctx, []string{req.GetName()}, docs); err != nil {
 		return nil, err
 	}
 	doc, ok := docs[req.GetName()]
@@ -206,6 +227,9 @@ func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.F
 
 	docs, err := s.store.GetDocuments(stream.Context(), req.GetDocuments())
 	if err != nil {
+		return err
+	}
+	if err := s.checkGet(stream.Context(), req.GetDocuments(), docs); err != nil {
 		return err
 	}
 
@@ -250,6 +274,9 @@ func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.F
 // ListCollectionIds lists the collection ids under a parent, from the
 // registry maintained on write.
 func (s *Server) ListCollectionIds(ctx context.Context, req *pb.ListCollectionIdsRequest) (*pb.ListCollectionIdsResponse, error) {
+	if err := adminOnly(ctx); err != nil {
+		return nil, err
+	}
 	ids, err := s.store.ListCollectionIDs(ctx, req.GetParent())
 	if err != nil {
 		return nil, err

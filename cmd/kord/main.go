@@ -52,6 +52,7 @@ func main() {
 	oidcIssuer := flag.String("oidc-issuer", os.Getenv("KORD_OIDC_ISSUER"), "accept tokens from this OIDC issuer (e.g. Entra)")
 	oidcAudience := flag.String("oidc-audience", os.Getenv("KORD_OIDC_AUDIENCE"), "required audience for -oidc-issuer tokens")
 	oidcJWKS := flag.String("oidc-jwks", os.Getenv("KORD_OIDC_JWKS"), "JWKS URL for -oidc-issuer")
+	rulesFile := flag.String("rules", os.Getenv("KORD_RULES"), "Firestore security rules file applied to end-user requests (needs -auth)")
 	emulatorMode := flag.Bool("emulator", envOr("KORD_EMULATOR", "") != "", "serve the Firebase-emulator development endpoints (load rules, clear data)")
 	logLevel := flag.String("log", envOr("KORD_LOG", "info"), "log level: debug|info|warn|error")
 	metricsAddr := flag.String("metrics", envOr("KORD_METRICS", "127.0.0.1:6566"), "Prometheus /metrics address (empty = disabled)")
@@ -151,7 +152,19 @@ func main() {
 	)
 	rpcSrv := rpc.New(be)
 	rpcSrv.Register(g)
-	opts := web.Options{Emulator: *emulatorMode, Log: log}
+	if *rulesFile != "" {
+		src, err := os.ReadFile(*rulesFile)
+		if err != nil {
+			log.Error("read rules", "file", *rulesFile, "err", err)
+			os.Exit(2)
+		}
+		if err := rpcSrv.SetDefaultRules(string(src)); err != nil {
+			log.Error("parse rules", "file", *rulesFile, "err", err)
+			os.Exit(2)
+		}
+		log.Info("security rules loaded", "file", *rulesFile)
+	}
+	opts := web.Options{Emulator: *emulatorMode, Log: log, LoadRules: rpcSrv.SetProjectRules}
 	if clearer, ok := be.(backend.Clearer); ok {
 		opts.ClearDatabase = clearer.ClearDatabase
 	}

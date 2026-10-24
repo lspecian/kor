@@ -262,7 +262,7 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 	for _, name := range targets {
 		if doc, ok := existing[name]; ok {
 			states[name] = &writes.DocState{
-				Name: name, Exists: true, Fields: doc.Fields,
+				Name: name, Exists: true, Fields: backend.CloneFields(doc.Fields),
 				CreateTime: doc.CreateTime, UpdateTime: doc.UpdateTime,
 			}
 		} else {
@@ -278,6 +278,16 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			return nil, time.Time{}, err
 		}
 		results = append(results, res)
+	}
+
+	for _, name := range targets {
+		st := states[name]
+		if !st.Dirty {
+			continue
+		}
+		if err := backend.RunCommitCheck(ctx, name, existing[name], afterDoc(st)); err != nil {
+			return nil, time.Time{}, err
+		}
 	}
 
 	for _, name := range targets {
@@ -326,4 +336,12 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 		return nil, time.Time{}, fmt.Errorf("store: commit: %w", err)
 	}
 	return results, commitTime, nil
+}
+
+// afterDoc is the document a commit will store for st, or nil for a delete.
+func afterDoc(st *writes.DocState) *Doc {
+	if !st.Exists {
+		return nil
+	}
+	return &Doc{Name: st.Name, Fields: st.Fields, CreateTime: st.CreateTime, UpdateTime: st.UpdateTime}
 }
