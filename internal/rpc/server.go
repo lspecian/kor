@@ -26,11 +26,17 @@ import (
 type Server struct {
 	pb.UnimplementedFirestoreServer
 	store backend.Backend
+	hub   *hub // nil when the backend has no change feed
 }
 
-// New returns a Firestore service backed by b.
+// New returns a Firestore service backed by b. Live updates are served when b
+// also implements backend.ChangeFeed.
 func New(b backend.Backend) *Server {
-	return &Server{store: b}
+	s := &Server{store: b}
+	if feed, ok := b.(backend.ChangeFeed); ok {
+		s.hub = newHub(feed)
+	}
+	return s
 }
 
 // Register attaches the service to a gRPC server.

@@ -14,6 +14,7 @@ package cosmos
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -45,9 +46,14 @@ const maxBatchOps = 100
 const commitAttempts = 8
 
 const (
-	kindDoc   = "doc"
-	kindGuard = "guard"
+	kindDoc    = "doc"
+	kindGuard  = "guard"
+	kindChange = "change"
 )
+
+// changeTTLSeconds is how long change records live. Watchers only look a few
+// seconds back; the rest is headroom for event consumers that restart.
+const changeTTLSeconds = 24 * 60 * 60
 
 // Config selects the Cosmos account, database, container and partition.
 type Config struct {
@@ -104,9 +110,13 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cosmos: database: %w", err)
 		}
+		// DefaultTimeToLive -1 turns on per-item TTL without expiring
+		// documents, so change records can carry their own ttl.
+		noDefaultExpiry := int32(-1)
 		props := azcosmos.ContainerProperties{
 			ID:                     cfg.Container,
 			PartitionKeyDefinition: azcosmos.PartitionKeyDefinition{Paths: []string{"/customer_id"}},
+			DefaultTimeToLive:      &noDefaultExpiry,
 		}
 		if _, err := db.CreateContainer(ctx, props, nil); err != nil && !isStatus(err, http.StatusConflict) {
 			return nil, fmt.Errorf("cosmos: create container: %w", err)
@@ -303,11 +313,13 @@ func (s *Store) tryCommit(ctx context.Context, ws []*pb.Write, verify map[string
 
 	batch := s.container.NewTransactionalBatch(s.pk)
 	ops := 0
+	var changes []changeEntry
 	for _, name := range targets {
 		st := states[name]
 		if !st.Dirty {
 			continue
 		}
+		changes = append(changes, changeEntry{Name: name, CollectionID: paths[name].CollectionID, Delete: !st.Exists})
 		cur := seen[name]
 		if st.Exists {
 			body, err := s.encode(paths[name], st)
@@ -350,6 +362,16 @@ func (s *Store) tryCommit(ctx context.Context, ws []*pb.Write, verify map[string
 
 	if ops == 0 {
 		return results, commitTime, nil
+	}
+	// One change record per commit, in the same batch: the change feed sees
+	// a commit if and only if it happened, deletes included.
+	if len(changes) > 0 {
+		body, err := s.encodeChange(commitTime, changes)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		batch.CreateItem(body, nil)
+		ops++
 	}
 	if ops > maxBatchOps {
 		return nil, time.Time{}, status.Errorf(codes.InvalidArgument,
@@ -400,6 +422,38 @@ func (s *Store) encode(p backend.DocPath, st *writes.DocState) ([]byte, error) {
 		Data:         data,
 		CreateUS:     st.CreateTime.UnixMicro(),
 		UpdateUS:     st.UpdateTime.UnixMicro(),
+	})
+}
+
+// changeEntry is one document event inside a change record.
+type changeEntry struct {
+	Name         string `json:"name"`
+	CollectionID string `json:"collection_id"`
+	Delete       bool   `json:"delete,omitempty"`
+}
+
+// changeItem records which documents one commit wrote or deleted.
+type changeItem struct {
+	ID         string        `json:"id"`
+	CustomerID string        `json:"customer_id"`
+	Kind       string        `json:"kind"`
+	AtUS       int64         `json:"at_us"`
+	Changes    []changeEntry `json:"changes"`
+	TTL        int           `json:"ttl"`
+}
+
+func (s *Store) encodeChange(at time.Time, changes []changeEntry) ([]byte, error) {
+	id := make([]byte, 12)
+	if _, err := rand.Read(id); err != nil {
+		return nil, fmt.Errorf("cosmos: change id: %w", err)
+	}
+	return json.Marshal(changeItem{
+		ID:         "c" + hex.EncodeToString(id),
+		CustomerID: s.customer,
+		Kind:       kindChange,
+		AtUS:       at.UnixMicro(),
+		Changes:    changes,
+		TTL:        changeTTLSeconds,
 	})
 }
 
