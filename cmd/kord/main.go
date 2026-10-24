@@ -10,6 +10,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -26,6 +30,7 @@ import (
 	"github.com/omelas-tech/kor/internal/auth"
 	"github.com/omelas-tech/kor/internal/backend"
 	"github.com/omelas-tech/kor/internal/cosmos"
+	"github.com/omelas-tech/kor/internal/identity"
 	"github.com/omelas-tech/kor/internal/rpc"
 	"github.com/omelas-tech/kor/internal/store"
 	"github.com/omelas-tech/kor/internal/web"
@@ -52,6 +57,10 @@ func main() {
 	oidcIssuer := flag.String("oidc-issuer", os.Getenv("KORD_OIDC_ISSUER"), "accept tokens from this OIDC issuer (e.g. Entra)")
 	oidcAudience := flag.String("oidc-audience", os.Getenv("KORD_OIDC_AUDIENCE"), "required audience for -oidc-issuer tokens")
 	oidcJWKS := flag.String("oidc-jwks", os.Getenv("KORD_OIDC_JWKS"), "JWKS URL for -oidc-issuer")
+	identityProject := flag.String("identity-project", os.Getenv("KORD_IDENTITY_PROJECT"), "serve the Firebase Auth sign-in bridge for this project")
+	identityKey := flag.String("identity-key", os.Getenv("KORD_IDENTITY_KEY"), "PEM file holding the bridge's signing key (created if missing)")
+	trustCustomTokens := flag.Bool("identity-trust-unsigned-custom-tokens", envOr("KORD_IDENTITY_TRUST_UNSIGNED_CUSTOM_TOKENS", "") != "", "accept custom tokens without verifying them, as the Auth emulator does (development only)")
+	extraListen := flag.String("extra-listen", os.Getenv("KORD_EXTRA_LISTEN"), "comma-separated extra addresses serving the same endpoints (e.g. the Auth emulator port)")
 	rulesFile := flag.String("rules", os.Getenv("KORD_RULES"), "Firestore security rules file applied to end-user requests (needs -auth)")
 	emulatorMode := flag.Bool("emulator", envOr("KORD_EMULATOR", "") != "", "serve the Firebase-emulator development endpoints (load rules, clear data)")
 	logLevel := flag.String("log", envOr("KORD_LOG", "info"), "log level: debug|info|warn|error")
@@ -165,6 +174,27 @@ func main() {
 		log.Info("security rules loaded", "file", *rulesFile)
 	}
 	opts := web.Options{Emulator: *emulatorMode, Log: log, LoadRules: rpcSrv.SetProjectRules}
+	if *identityProject != "" {
+		key, err := loadOrCreateKey(*identityKey)
+		if err != nil {
+			log.Error("identity key", "file", *identityKey, "err", err)
+			os.Exit(2)
+		}
+		var exchange *auth.Verifier
+		if *oidcIssuer != "" {
+			exchange = auth.NewVerifier(authConfig(false, "", false, "", *oidcIssuer, *oidcAudience, *oidcJWKS))
+		}
+		bridge, err := identity.New(identity.Config{
+			Project: *identityProject, Key: key, TrustUnsignedCustomTokens: *trustCustomTokens, Exchange: exchange, Log: log,
+		}, be)
+		if err != nil {
+			log.Error("identity bridge", "err", err)
+			os.Exit(2)
+		}
+		verifier.AddIssuer(bridge.TrustedIssuer())
+		opts.Extra = append(opts.Extra, bridge.Handle)
+		log.Info("sign-in bridge on", "project", *identityProject, "exchange", exchange != nil)
+	}
 	if clearer, ok := be.(backend.Clearer); ok {
 		opts.ClearDatabase = clearer.ClearDatabase
 	}
@@ -188,6 +218,24 @@ func main() {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
+	for _, addr := range strings.Split(*extraListen, ",") {
+		if addr = strings.TrimSpace(addr); addr == "" {
+			continue
+		}
+		if !*allowPublic {
+			if err := requireLoopback(addr); err != nil {
+				log.Error("refusing extra listener", "addr", addr, "err", err)
+				os.Exit(2)
+			}
+		}
+		extra, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Error("listen", "addr", addr, "err", err)
+			os.Exit(1)
+		}
+		go func() { _ = httpSrv.Serve(extra) }()
+		log.Info("kord also serving", "addr", extra.Addr().String())
+	}
 	log.Info("kord serving", "addr", lis.Addr().String(), "transports", "grpc,rest,webchannel")
 	if err := httpSrv.Serve(lis); err != nil && err != http.ErrServerClosed {
 		log.Error("serve", "err", err)
@@ -295,4 +343,31 @@ func startIndexLoader(ctx context.Context, log *slog.Logger, st *store.Store) {
 			}
 		}
 	}()
+}
+
+// loadOrCreateKey reads an RSA key from a PEM file, creating the file when it
+// does not exist; an empty path returns a fresh key that lives with the
+// process.
+func loadOrCreateKey(path string) (*rsa.PrivateKey, error) {
+	if path == "" {
+		return rsa.GenerateKey(rand.Reader, 2048)
+	}
+	if raw, err := os.ReadFile(path); err == nil {
+		block, _ := pem.Decode(raw)
+		if block == nil {
+			return nil, fmt.Errorf("%s: no PEM block", path)
+		}
+		return x509.ParsePKCS1PrivateKey(block.Bytes)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		return nil, err
+	}
+	return key, nil
 }

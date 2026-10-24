@@ -3,7 +3,7 @@
   "private": true,
   "description": "Drives the official Firebase web SDK in headless Chrome against Kor (WebChannel and REST).",
   "scripts": {
-    "build": "esbuild src/sdk-page.js --bundle --format=esm --outfile=dist/sdk-page.js",
+    "build": "esbuild src/sdk-page.js src/auth-page.js --bundle --format=esm --outdir=dist",
     "test": "npm run build && node run.mjs"
   },
   "dependencies": {
