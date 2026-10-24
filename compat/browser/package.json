@@ -1,0 +1,14 @@
+{
+  "name": "kor-browser-tests",
+  "private": true,
+  "description": "Drives the official Firebase web SDK in headless Chrome against Kor (WebChannel and REST).",
+  "scripts": {
+    "build": "esbuild src/sdk-page.js --bundle --format=esm --outfile=dist/sdk-page.js",
+    "test": "npm run build && node run.mjs"
+  },
+  "dependencies": {
+    "esbuild": "0.25.12",
+    "firebase": "10.14.1",
+    "puppeteer": "23.11.1"
+  }
+}

@@ -14,17 +14,21 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 
+	"github.com/omelas-tech/kor/internal/auth"
 	"github.com/omelas-tech/kor/internal/backend"
 	"github.com/omelas-tech/kor/internal/cosmos"
 	"github.com/omelas-tech/kor/internal/rpc"
 	"github.com/omelas-tech/kor/internal/store"
+	"github.com/omelas-tech/kor/internal/web"
 )
 
 // indexReloadInterval trades staleness for load. Index changes are rare and
@@ -41,6 +45,14 @@ func main() {
 	cosmosContainer := flag.String("cosmos-container", envOr("KORD_COSMOS_CONTAINER", "documents"), "Cosmos DB container, partitioned on /customer_id")
 	customerID := flag.String("customer-id", os.Getenv("KORD_CUSTOMER_ID"), "partition value for every document (-backend cosmos)")
 	cosmosCreate := flag.Bool("cosmos-create", envOr("KORD_COSMOS_CREATE", "") != "", "create the Cosmos database and container if missing (local use)")
+	authOn := flag.Bool("auth", envOr("KORD_AUTH", "") != "", "authenticate requests (off: every request is admin, as upstream Kor)")
+	adminTokens := flag.String("admin-tokens", os.Getenv("KORD_ADMIN_TOKENS"), "comma-separated bearer values that act as admin (backend services)")
+	allowUnsigned := flag.Bool("allow-unsigned-tokens", envOr("KORD_ALLOW_UNSIGNED_TOKENS", "") != "", "accept unsigned Firebase-emulator tokens (development only)")
+	firebaseProject := flag.String("firebase-project", os.Getenv("KORD_FIREBASE_PROJECT"), "accept Firebase Auth ID tokens for this project")
+	oidcIssuer := flag.String("oidc-issuer", os.Getenv("KORD_OIDC_ISSUER"), "accept tokens from this OIDC issuer (e.g. Entra)")
+	oidcAudience := flag.String("oidc-audience", os.Getenv("KORD_OIDC_AUDIENCE"), "required audience for -oidc-issuer tokens")
+	oidcJWKS := flag.String("oidc-jwks", os.Getenv("KORD_OIDC_JWKS"), "JWKS URL for -oidc-issuer")
+	emulatorMode := flag.Bool("emulator", envOr("KORD_EMULATOR", "") != "", "serve the Firebase-emulator development endpoints (load rules, clear data)")
 	logLevel := flag.String("log", envOr("KORD_LOG", "info"), "log level: debug|info|warn|error")
 	metricsAddr := flag.String("metrics", envOr("KORD_METRICS", "127.0.0.1:6566"), "Prometheus /metrics address (empty = disabled)")
 	allowPublic := flag.Bool("i-know-this-is-unauthenticated", envOr("KORD_ALLOW_PUBLIC_BIND", "") != "",
@@ -122,6 +134,11 @@ func main() {
 		startIndexLoader(ctx, log, st)
 	}
 
+	verifier := auth.NewVerifier(authConfig(!*authOn, *adminTokens, *allowUnsigned, *firebaseProject, *oidcIssuer, *oidcAudience, *oidcJWKS))
+	if verifier.Enabled() {
+		log.Info("authentication on", "firebase_project", *firebaseProject, "oidc_issuer", *oidcIssuer, "unsigned_tokens", *allowUnsigned)
+	}
+
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Error("listen", "addr", *listen, "err", err)
@@ -129,10 +146,17 @@ func main() {
 	}
 
 	g := grpc.NewServer(
-		grpc.UnaryInterceptor(rpc.UnaryLogging(log)),
-		grpc.StreamInterceptor(rpc.StreamLogging(log)),
+		grpc.ChainUnaryInterceptor(rpc.UnaryLogging(log), auth.UnaryInterceptor(verifier)),
+		grpc.ChainStreamInterceptor(rpc.StreamLogging(log), auth.StreamInterceptor(verifier)),
 	)
-	rpc.New(be).Register(g)
+	rpcSrv := rpc.New(be)
+	rpcSrv.Register(g)
+	opts := web.Options{Emulator: *emulatorMode, Log: log}
+	if clearer, ok := be.(backend.Clearer); ok {
+		opts.ClearDatabase = clearer.ClearDatabase
+	}
+	webSrv := web.New(rpcSrv, g, verifier, opts)
+	defer webSrv.Close()
 	rpc.StartStatsReporter(ctx, log, time.Minute)
 	if *metricsAddr != "" {
 		metricsSrv := rpc.ServeMetrics(*metricsAddr)
@@ -140,17 +164,47 @@ func main() {
 		log.Info("metrics listening", "addr", *metricsAddr)
 	}
 
+	// One listener serves gRPC (HTTP/2) and the HTTP surface (REST,
+	// WebChannel), like the Firebase emulator, so every SDK uses one address.
+	httpSrv := &http.Server{Handler: webSrv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		log.Info("shutting down")
-		g.GracefulStop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Info("kord serving", "addr", lis.Addr().String())
-	if err := g.Serve(lis); err != nil {
+	log.Info("kord serving", "addr", lis.Addr().String(), "transports", "grpc,rest,webchannel")
+	if err := httpSrv.Serve(lis); err != nil && err != http.ErrServerClosed {
 		log.Error("serve", "err", err)
 		os.Exit(1)
 	}
+}
+
+// authConfig builds the verifier settings from flags.
+func authConfig(disabled bool, adminTokens string, allowUnsigned bool, firebaseProject, oidcIssuer, oidcAudience, oidcJWKS string) auth.Config {
+	cfg := auth.Config{Disabled: disabled, AllowUnsigned: allowUnsigned}
+	for _, t := range strings.Split(adminTokens, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			cfg.AdminTokens = append(cfg.AdminTokens, t)
+		}
+	}
+	if firebaseProject != "" {
+		cfg.Issuers = append(cfg.Issuers, &auth.Issuer{
+			Issuer:    "https://securetoken.google.com/" + firebaseProject,
+			Audiences: []string{firebaseProject},
+			JWKSURL:   "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com",
+		})
+	}
+	if oidcIssuer != "" {
+		iss := &auth.Issuer{Issuer: oidcIssuer, JWKSURL: oidcJWKS}
+		if oidcAudience != "" {
+			iss.Audiences = []string{oidcAudience}
+		}
+		cfg.Issuers = append(cfg.Issuers, iss)
+	}
+	return cfg
 }
 
 func envOr(key, def string) string {

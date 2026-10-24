@@ -174,18 +174,9 @@ func (t *target) relevant(collections, names map[string]bool) bool {
 	return false
 }
 
-// Listen streams live updates for queries and documents.
+// Listen streams live updates for queries and documents over gRPC.
 func (s *Server) Listen(stream pb.Firestore_ListenServer) error {
-	if s.hub == nil {
-		return status.Error(codes.Unimplemented, "kor: this storage backend has no change feed")
-	}
 	ctx := stream.Context()
-	sub, err := s.hub.subscribe(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.hub.unsubscribe(sub)
-
 	reqs := make(chan *pb.ListenRequest)
 	recvErr := make(chan error, 1)
 	go func() {
@@ -202,16 +193,32 @@ func (s *Server) Listen(stream pb.Firestore_ListenServer) error {
 			}
 		}
 	}()
+	err := s.ServeListen(ctx, reqs, recvErr, stream.Send)
+	if errors.Is(err, io.EOF) || status.Code(err) == codes.Canceled {
+		return nil
+	}
+	return err
+}
 
-	l := &listener{store: s.store, stream: stream, targets: map[int32]*target{}}
+// ServeListen runs one Listen session on any transport: requests arrive on
+// reqs, responses go out through send, and a value on done (or ctx ending)
+// closes the session. gRPC and WebChannel both use it.
+func (s *Server) ServeListen(ctx context.Context, reqs <-chan *pb.ListenRequest, done <-chan error, send func(*pb.ListenResponse) error) error {
+	if s.hub == nil {
+		return status.Error(codes.Unimplemented, "kor: this storage backend has no change feed")
+	}
+	sub, err := s.hub.subscribe(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.hub.unsubscribe(sub)
+
+	l := &listener{server: s, send: send, targets: map[int32]*target{}}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case err := <-recvErr:
-			if errors.Is(err, io.EOF) || status.Code(err) == codes.Canceled {
-				return nil
-			}
+		case err := <-done:
 			return err
 		case req := <-reqs:
 			if err := l.handle(ctx, req); err != nil {
@@ -227,8 +234,8 @@ func (s *Server) Listen(stream pb.Firestore_ListenServer) error {
 }
 
 type listener struct {
-	store   backend.Backend
-	stream  pb.Firestore_ListenServer
+	server  *Server
+	send    func(*pb.ListenResponse) error
 	targets map[int32]*target
 }
 
@@ -349,7 +356,7 @@ func (l *listener) onChanges(ctx context.Context, changes []backend.Change, resy
 func (l *listener) evaluate(ctx context.Context, t *target) (map[string]*backend.Doc, error) {
 	out := map[string]*backend.Doc{}
 	if t.query != nil {
-		err := l.store.RunQuery(ctx, t.query, func(doc *backend.Doc) error {
+		err := l.server.store.RunQuery(ctx, t.query, func(doc *backend.Doc) error {
 			out[doc.Name] = doc
 			return nil
 		})
@@ -359,7 +366,7 @@ func (l *listener) evaluate(ctx context.Context, t *target) (map[string]*backend
 	for name := range t.names {
 		names = append(names, name)
 	}
-	return l.store.GetDocuments(ctx, names)
+	return l.server.store.GetDocuments(ctx, names)
 }
 
 func (l *listener) sendDoc(doc *backend.Doc, targetID int32) error {
@@ -367,7 +374,7 @@ func (l *listener) sendDoc(doc *backend.Doc, targetID int32) error {
 	if err != nil {
 		return err
 	}
-	return l.stream.Send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_DocumentChange{
+	return l.send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_DocumentChange{
 		DocumentChange: &pb.DocumentChange{Document: d, TargetIds: []int32{targetID}},
 	}})
 }
@@ -376,11 +383,11 @@ func (l *listener) sendDoc(doc *backend.Doc, targetID int32) error {
 // matching its query.
 func (l *listener) sendGone(name string, targetID int32, deleted bool) error {
 	if deleted {
-		return l.stream.Send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_DocumentDelete{
+		return l.send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_DocumentDelete{
 			DocumentDelete: &pb.DocumentDelete{Document: name, RemovedTargetIds: []int32{targetID}, ReadTime: now()},
 		}})
 	}
-	return l.stream.Send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_DocumentRemove{
+	return l.send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_DocumentRemove{
 		DocumentRemove: &pb.DocumentRemove{Document: name, RemovedTargetIds: []int32{targetID}, ReadTime: now()},
 	}})
 }
@@ -391,12 +398,12 @@ func (l *listener) targetChange(kind pb.TargetChange_TargetChangeType, ids []int
 		tc.ReadTime = readTime
 		tc.ResumeToken = resumeToken(readTime)
 	}
-	return l.stream.Send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_TargetChange{TargetChange: tc}})
+	return l.send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_TargetChange{TargetChange: tc}})
 }
 
 // reject removes a target the server cannot serve, carrying the reason.
 func (l *listener) reject(id int32, err error) error {
-	return l.stream.Send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_TargetChange{TargetChange: &pb.TargetChange{
+	return l.send(&pb.ListenResponse{ResponseType: &pb.ListenResponse_TargetChange{TargetChange: &pb.TargetChange{
 		TargetChangeType: pb.TargetChange_REMOVE,
 		TargetIds:        []int32{id},
 		Cause:            statusProto(err),

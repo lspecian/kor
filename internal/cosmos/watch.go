@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"time"
 
@@ -86,4 +87,51 @@ func (s *Store) WatchChanges(ctx context.Context, ready func(), fn func([]backen
 		case <-time.After(watchPollInterval):
 		}
 	}
+}
+
+var _ backend.Clearer = (*Store)(nil)
+
+// ClearDatabase deletes every document of a database in this partition
+// (development only) and records the deletes for open listeners.
+func (s *Store) ClearDatabase(ctx context.Context, database string) error {
+	prefix := database + "/documents/"
+	pager := s.container.NewQueryItemsPager(
+		`SELECT c.id, c.name, c.collection_id FROM c WHERE c.kind = "doc" AND STARTSWITH(c.name, @prefix)`, s.pk,
+		&azcosmos.QueryOptions{QueryParameters: []azcosmos.QueryParameter{{Name: "@prefix", Value: prefix}}})
+	var gone []changeEntry
+	var ids []string
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("cosmos: clear: %w", err)
+		}
+		for _, raw := range page.Items {
+			var row struct {
+				ID           string `json:"id"`
+				Name         string `json:"name"`
+				CollectionID string `json:"collection_id"`
+			}
+			if err := json.Unmarshal(raw, &row); err != nil {
+				return fmt.Errorf("cosmos: clear: %w", err)
+			}
+			ids = append(ids, row.ID)
+			gone = append(gone, changeEntry{Name: row.Name, CollectionID: row.CollectionID, Delete: true})
+		}
+	}
+	for _, id := range ids {
+		if _, err := s.container.DeleteItem(ctx, s.pk, id, nil); err != nil && !isStatus(err, http.StatusNotFound) {
+			return fmt.Errorf("cosmos: clear %s: %w", id, err)
+		}
+	}
+	if len(gone) == 0 {
+		return nil
+	}
+	body, err := s.encodeChange(time.Now().UTC(), gone)
+	if err != nil {
+		return err
+	}
+	if _, err := s.container.CreateItem(ctx, s.pk, body, nil); err != nil {
+		return fmt.Errorf("cosmos: clear: record deletes: %w", err)
+	}
+	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -79,4 +80,34 @@ func (s *Store) changelogHead(ctx context.Context) (Cursor, error) {
 		return Cursor{}, fmt.Errorf("store: changelog head xid %q: %w", xid, err)
 	}
 	return Cursor{XID: x, Seq: seq}, nil
+}
+
+var _ backend.Clearer = (*Store)(nil)
+
+// ClearDatabase deletes every document of a database (development only),
+// recording a delete event for each so open listeners see them go.
+func (s *Store) ClearDatabase(ctx context.Context, database string) error {
+	lo, hi := database+"/documents/", database+"/documents0"
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: clear: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	stmts := []string{
+		`DELETE FROM index_entries WHERE doc_name >= $1 AND doc_name < $2`,
+		`WITH gone AS (DELETE FROM documents WHERE name >= $1 AND name < $2 RETURNING name, collection_id)
+		 INSERT INTO changelog (xid, doc_name, collection_id, kind)
+		 SELECT pg_current_xact_id(), name, collection_id, 'delete' FROM gone`,
+		`DELETE FROM collections WHERE parent_path >= $3 AND parent_path < $2`,
+	}
+	for _, q := range stmts {
+		args := []any{lo, hi}
+		if strings.Contains(q, "$3") {
+			args = append(args, database+"/documents")
+		}
+		if _, err := tx.Exec(ctx, q, args...); err != nil {
+			return fmt.Errorf("store: clear: %w", err)
+		}
+	}
+	return tx.Commit(ctx)
 }
