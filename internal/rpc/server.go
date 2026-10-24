@@ -189,6 +189,11 @@ func (s *Server) GetDocument(ctx context.Context, req *pb.GetDocumentRequest) (*
 	if req.GetReadTime() != nil {
 		return nil, status.Error(codes.Unimplemented, "kor: read-time reads not implemented yet")
 	}
+	if txn := req.GetTransaction(); len(txn) > 0 {
+		if err := s.store.LockTxnReads(ctx, txn, []string{req.GetName()}); err != nil {
+			return nil, err
+		}
+	}
 	docs, err := s.store.GetDocuments(ctx, []string{req.GetName()})
 	if err != nil {
 		return nil, err
@@ -223,6 +228,11 @@ func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.F
 	if req.GetNewTransaction() != nil {
 		newTxn = s.store.BeginTxn()
 		txnID = newTxn
+	}
+	if len(txnID) > 0 {
+		if err := s.store.LockTxnReads(stream.Context(), txnID, req.GetDocuments()); err != nil {
+			return err
+		}
 	}
 
 	docs, err := s.store.GetDocuments(stream.Context(), req.GetDocuments())

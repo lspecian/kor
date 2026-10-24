@@ -33,8 +33,12 @@ type Backend interface {
 	// the commit time.
 	Commit(ctx context.Context, ws []*pb.Write) ([]*pb.WriteResult, time.Time, error)
 
-	// BeginTxn starts an optimistic transaction and returns its id.
+	// BeginTxn starts a transaction and returns its id.
 	BeginTxn() []byte
+	// LockTxnReads takes the read locks of documents a transaction is about
+	// to read, waiting while other transactions hold them (codes.Aborted
+	// after a bounded wait).
+	LockTxnReads(ctx context.Context, id []byte, names []string) error
 	// RecordTxnReads remembers the update times a transaction observed, so
 	// CommitTxn can reject the commit if any of them changed.
 	RecordTxnReads(id []byte, reads map[string]time.Time) error

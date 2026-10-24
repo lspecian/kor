@@ -21,6 +21,11 @@ import (
 // BeginTxn starts a transaction and returns its opaque id.
 func (s *Store) BeginTxn() []byte { return s.txns.Begin() }
 
+// LockTxnReads takes the read locks of documents a transaction will read.
+func (s *Store) LockTxnReads(ctx context.Context, id []byte, names []string) error {
+	return s.txns.Lock(ctx, id, names)
+}
+
 // RecordTxnReads notes the versions observed by transactional reads.
 func (s *Store) RecordTxnReads(id []byte, reads map[string]time.Time) error {
 	return s.txns.Record(id, reads)
@@ -32,7 +37,8 @@ func (s *Store) RollbackTxn(id []byte) { s.txns.Drop(id) }
 // CommitTxn atomically verifies the transaction's reads and applies writes.
 // Version drift returns ABORTED, which Firestore SDKs retry automatically.
 func (s *Store) CommitTxn(ctx context.Context, id []byte, ws []*pb.Write) ([]*pb.WriteResult, time.Time, error) {
-	reads, err := s.txns.Take(id)
+	reads, release, err := s.txns.Take(id)
+	defer release()
 	if err != nil {
 		return nil, time.Time{}, err
 	}

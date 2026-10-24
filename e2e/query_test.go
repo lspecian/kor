@@ -253,7 +253,10 @@ func TestSDKTransactions(t *testing.T) {
 		if _, err := ref.Set(ctx, map[string]any{"count": int64(0)}); err != nil {
 			t.Fatal(err)
 		}
-		const workers = 20
+		// Modified in this fork: 40 contenders (was 20). Transactions lock what
+		// they read, as Firestore's do, so all of them commit within the
+		// SDK's default retries on every backend, not only on a fast one.
+		const workers = 40
 		var wg sync.WaitGroup
 		errs := make(chan error, workers)
 		for i := 0; i < workers; i++ {

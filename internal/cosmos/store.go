@@ -219,6 +219,11 @@ func (s *Store) Commit(ctx context.Context, ws []*pb.Write) ([]*pb.WriteResult, 
 // BeginTxn starts an optimistic transaction.
 func (s *Store) BeginTxn() []byte { return s.txns.Begin() }
 
+// LockTxnReads takes the read locks of documents a transaction will read.
+func (s *Store) LockTxnReads(ctx context.Context, id []byte, names []string) error {
+	return s.txns.Lock(ctx, id, names)
+}
+
 // RecordTxnReads notes the versions observed by transactional reads.
 func (s *Store) RecordTxnReads(id []byte, reads map[string]time.Time) error {
 	return s.txns.Record(id, reads)
@@ -230,7 +235,8 @@ func (s *Store) RollbackTxn(id []byte) { s.txns.Drop(id) }
 // CommitTxn verifies the transaction's reads and applies its writes in one
 // batch. Any change since the reads returns ABORTED so the SDK retries.
 func (s *Store) CommitTxn(ctx context.Context, id []byte, ws []*pb.Write) ([]*pb.WriteResult, time.Time, error) {
-	reads, err := s.txns.Take(id)
+	reads, release, err := s.txns.Take(id)
+	defer release()
 	if err != nil {
 		return nil, time.Time{}, err
 	}
