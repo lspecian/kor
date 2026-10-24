@@ -1,0 +1,11 @@
+{
+  "name": "kor-functions-runner-fixture",
+  "private": true,
+  "description": "A Firebase Functions codebase exercising each trigger kind the runner serves.",
+  "main": "index.js",
+  "dependencies": {
+    "express": "4.22.2",
+    "firebase-admin": "12.7.0",
+    "firebase-functions": "6.6.0"
+  }
+}
