@@ -1,3 +1,5 @@
+// Modified in this fork: ErrStop is shared with every backend.
+
 package store
 
 import (
@@ -10,6 +12,7 @@ import (
 
 	pb "cloud.google.com/go/firestore/apiv1/firestorepb"
 
+	"github.com/omelas-tech/kor/internal/backend"
 	"github.com/omelas-tech/kor/internal/index"
 	"github.com/omelas-tech/kor/internal/query"
 	"github.com/omelas-tech/kor/internal/value"
@@ -17,7 +20,7 @@ import (
 
 // ErrStop can be returned by a RunQuery yield callback to end iteration
 // early without error.
-var ErrStop = fmt.Errorf("kor: stop iteration")
+var ErrStop = backend.ErrStop
 
 // RunQuery streams matching documents to yield in query order.
 //

@@ -1,5 +1,7 @@
 // Package e2e proves the wire swap: the unmodified official Go Firestore SDK
 // (cloud.google.com/go/firestore) talking to kord via FIRESTORE_EMULATOR_HOST.
+//
+// Modified in this fork: the server under test comes from openBackend.
 package e2e
 
 import (
@@ -16,7 +18,6 @@ import (
 
 	"github.com/omelas-tech/kor/internal/pgtest"
 	"github.com/omelas-tech/kor/internal/rpc"
-	"github.com/omelas-tech/kor/internal/store"
 )
 
 func TestMain(m *testing.M) { pgtest.Main(m) }
@@ -25,12 +26,7 @@ func TestMain(m *testing.M) { pgtest.Main(m) }
 // SDK at it.
 func startKord(t *testing.T) {
 	t.Helper()
-	ctx := context.Background()
-	st, err := store.Open(ctx, pgtest.DSN(t))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(st.Close)
+	st := openBackend(t)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

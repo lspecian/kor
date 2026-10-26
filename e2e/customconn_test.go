@@ -1,3 +1,5 @@
+// Modified in this fork: the server under test comes from openBackend.
+
 package e2e
 
 import (
@@ -10,9 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/omelas-tech/kor/internal/pgtest"
 	"github.com/omelas-tech/kor/internal/rpc"
-	"github.com/omelas-tech/kor/internal/store"
 )
 
 // TestSDKDialWithoutEmulatorEnv proves the pattern a host application uses to
@@ -21,11 +21,7 @@ import (
 // FIRESTORE_EMULATOR_HOST deliberately unset.
 func TestSDKDialWithoutEmulatorEnv(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, pgtest.DSN(t))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(st.Close)
+	st := openBackend(t)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -1,4 +1,8 @@
 // Package store is Kor's PostgreSQL persistence layer.
+//
+// Modified in this fork: Doc, DocPath and the transaction registry moved to
+// package backend; Store implements backend.Backend; ListCollectionIDs moved
+// here from the RPC layer.
 package store
 
 import (
@@ -6,7 +10,6 @@ import (
 	"embed"
 	"fmt"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,9 +19,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/omelas-tech/kor/internal/backend"
 	"github.com/omelas-tech/kor/internal/value"
 	"github.com/omelas-tech/kor/internal/writes"
 )
+
+var _ backend.Backend = (*Store)(nil)
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
@@ -26,7 +32,7 @@ var migrationsFS embed.FS
 // Store wraps a Postgres pool holding Kor's document data.
 type Store struct {
 	Pool    *pgxpool.Pool
-	txns    txnRegistry
+	txns    backend.TxnRegistry
 	indexes indexRegistry
 	// indexedQueries counts queries served from index_entries. See
 	// IndexedQueries: registered and actually-used are different claims.
@@ -41,12 +47,7 @@ type Store struct {
 }
 
 // Doc is a stored document.
-type Doc struct {
-	Name       string
-	Fields     map[string]*pb.Value
-	CreateTime time.Time
-	UpdateTime time.Time
-}
+type Doc = backend.Doc
 
 // Open connects, applies migrations, and returns the store.
 func Open(ctx context.Context, dsn string) (*Store, error) {
@@ -67,6 +68,26 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 }
 
 func (s *Store) Close() { s.Pool.Close() }
+
+// ListCollectionIDs lists the collection ids directly under parent, from the
+// registry maintained on write.
+func (s *Store) ListCollectionIDs(ctx context.Context, parent string) ([]string, error) {
+	rows, err := s.Pool.Query(ctx,
+		`SELECT collection_id FROM collections WHERE parent_path = $1 ORDER BY collection_id`, parent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
 
 func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.Pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -117,37 +138,10 @@ func (s *Store) migrate(ctx context.Context) error {
 }
 
 // DocPath is a parsed document resource name.
-type DocPath struct {
-	Name         string // full resource name
-	ParentPath   string // resource name of the parent (database root or parent document)
-	CollectionID string
-	DocID        string
-}
+type DocPath = backend.DocPath
 
-// ParseDocumentName validates and splits a document resource name of the form
-// projects/{p}/databases/{d}/documents/{coll}/{doc}(/{coll}/{doc})*.
-func ParseDocumentName(name string) (DocPath, error) {
-	segs := strings.Split(name, "/")
-	if len(segs) < 7 || segs[0] != "projects" || segs[2] != "databases" || segs[4] != "documents" {
-		return DocPath{}, status.Errorf(codes.InvalidArgument, "invalid document name %q", name)
-	}
-	rel := segs[5:]
-	if len(rel)%2 != 0 {
-		return DocPath{}, status.Errorf(codes.InvalidArgument, "document name %q refers to a collection", name)
-	}
-	for _, s := range rel {
-		if s == "" {
-			return DocPath{}, status.Errorf(codes.InvalidArgument, "document name %q has empty segment", name)
-		}
-	}
-	parent := strings.Join(segs[:len(segs)-2], "/")
-	return DocPath{
-		Name:         name,
-		ParentPath:   parent,
-		CollectionID: segs[len(segs)-2],
-		DocID:        segs[len(segs)-1],
-	}, nil
-}
+// ParseDocumentName validates and splits a document resource name.
+func ParseDocumentName(name string) (DocPath, error) { return backend.ParseDocumentName(name) }
 
 // GetDocuments fetches the named documents. Missing names are simply absent
 // from the result map.
@@ -268,7 +262,7 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 	for _, name := range targets {
 		if doc, ok := existing[name]; ok {
 			states[name] = &writes.DocState{
-				Name: name, Exists: true, Fields: doc.Fields,
+				Name: name, Exists: true, Fields: backend.CloneFields(doc.Fields),
 				CreateTime: doc.CreateTime, UpdateTime: doc.UpdateTime,
 			}
 		} else {
@@ -284,6 +278,16 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			return nil, time.Time{}, err
 		}
 		results = append(results, res)
+	}
+
+	for _, name := range targets {
+		st := states[name]
+		if !st.Dirty {
+			continue
+		}
+		if err := backend.RunCommitCheck(ctx, name, existing[name], afterDoc(st)); err != nil {
+			return nil, time.Time{}, err
+		}
 	}
 
 	for _, name := range targets {
@@ -312,7 +316,7 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			if err := s.refreshIndexEntries(ctx, tx, name, p.CollectionID, st.Fields, false); err != nil {
 				return nil, time.Time{}, err
 			}
-			if err := appendChange(ctx, tx, name, p.CollectionID, "write"); err != nil {
+			if err := appendChangeImages(ctx, tx, name, p.CollectionID, "write", existing[name], afterDoc(st)); err != nil {
 				return nil, time.Time{}, err
 			}
 		} else {
@@ -322,7 +326,7 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 			if err := s.refreshIndexEntries(ctx, tx, name, paths[name].CollectionID, nil, true); err != nil {
 				return nil, time.Time{}, err
 			}
-			if err := appendChange(ctx, tx, name, paths[name].CollectionID, "delete"); err != nil {
+			if err := appendChangeImages(ctx, tx, name, paths[name].CollectionID, "delete", existing[name], nil); err != nil {
 				return nil, time.Time{}, err
 			}
 		}
@@ -332,4 +336,12 @@ func (s *Store) applyCommit(ctx context.Context, ws []*pb.Write, extraLocks []st
 		return nil, time.Time{}, fmt.Errorf("store: commit: %w", err)
 	}
 	return results, commitTime, nil
+}
+
+// afterDoc is the document a commit will store for st, or nil for a delete.
+func afterDoc(st *writes.DocState) *Doc {
+	if !st.Exists {
+		return nil
+	}
+	return &Doc{Name: st.Name, Fields: st.Fields, CreateTime: st.CreateTime, UpdateTime: st.UpdateTime}
 }

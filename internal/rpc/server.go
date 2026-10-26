@@ -1,6 +1,9 @@
 // Package rpc implements the google.firestore.v1.Firestore gRPC service on
-// top of Kor's store. Firestore SDKs connect to it via
+// top of a storage backend. Firestore SDKs connect to it via
 // FIRESTORE_EMULATOR_HOST or a custom host setting — no application changes.
+//
+// Modified in this fork: the service depends on backend.Backend instead of the
+// PostgreSQL store, and no longer queries the database directly.
 package rpc
 
 import (
@@ -15,19 +18,26 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/omelas-tech/kor/internal/backend"
 	"github.com/omelas-tech/kor/internal/query"
-	"github.com/omelas-tech/kor/internal/store"
 )
 
 // Server implements pb.FirestoreServer.
 type Server struct {
 	pb.UnimplementedFirestoreServer
-	store *store.Store
+	store backend.Backend
+	hub   *hub // nil when the backend has no change feed
+	rules rulesRegistry
 }
 
-// New returns a Firestore service backed by st.
-func New(st *store.Store) *Server {
-	return &Server{store: st}
+// New returns a Firestore service backed by b. Live updates are served when b
+// also implements backend.ChangeFeed.
+func New(b backend.Backend) *Server {
+	s := &Server{store: b}
+	if feed, ok := b.(backend.ChangeFeed); ok {
+		s.hub = newHub(feed)
+	}
+	return s
 }
 
 // Register attaches the service to a gRPC server.
@@ -43,6 +53,7 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 		commitTime time.Time
 		err        error
 	)
+	ctx = s.withWriteChecks(ctx)
 	if txn := req.GetTransaction(); len(txn) > 0 {
 		results, commitTime, err = s.store.CommitTxn(ctx, txn, req.GetWrites())
 	} else {
@@ -79,18 +90,30 @@ func (s *Server) RunQuery(req *pb.RunQueryRequest, stream pb.Firestore_RunQueryS
 		return err
 	}
 	readTime := timestamppb.New(time.Now().UTC().Truncate(time.Microsecond))
+	var docs []*backend.Doc
+	if err := s.store.RunQuery(stream.Context(), q, func(doc *backend.Doc) error {
+		docs = append(docs, doc)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := s.checkQueryRule(stream.Context(), q); err != nil {
+		return err
+	}
+	if err := s.checkList(stream.Context(), docs); err != nil {
+		return err
+	}
 	sent := 0
-	err = s.store.RunQuery(stream.Context(), q, func(doc *store.Doc) error {
+	for _, doc := range docs {
 		d, err := docProto(doc)
 		if err != nil {
 			return err
 		}
 		d.Fields = q.ApplyProjection(d.Fields)
 		sent++
-		return stream.Send(&pb.RunQueryResponse{Document: d, ReadTime: readTime})
-	})
-	if err != nil {
-		return err
+		if err := stream.Send(&pb.RunQueryResponse{Document: d, ReadTime: readTime}); err != nil {
+			return err
+		}
 	}
 	if sent == 0 {
 		// Empty result: a document-less response carries the read time.
@@ -124,6 +147,9 @@ func (s *Server) RunAggregationQuery(req *pb.RunAggregationQueryRequest, stream 
 			}
 		}
 	}
+	if err := s.checkQuery(stream.Context(), q); err != nil {
+		return err
+	}
 	n, err := s.store.RunCount(stream.Context(), q, upTo)
 	if err != nil {
 		return err
@@ -143,6 +169,7 @@ func (s *Server) RunAggregationQuery(req *pb.RunAggregationQueryRequest, stream 
 // per-entry rather than failing the RPC.
 func (s *Server) BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb.BatchWriteResponse, error) {
 	resp := &pb.BatchWriteResponse{}
+	ctx = s.withWriteChecks(ctx)
 	for _, w := range req.GetWrites() {
 		results, _, err := s.store.Commit(ctx, []*pb.Write{w})
 		if err != nil {
@@ -162,8 +189,16 @@ func (s *Server) GetDocument(ctx context.Context, req *pb.GetDocumentRequest) (*
 	if req.GetReadTime() != nil {
 		return nil, status.Error(codes.Unimplemented, "kor: read-time reads not implemented yet")
 	}
+	if txn := req.GetTransaction(); len(txn) > 0 {
+		if err := s.store.LockTxnReads(ctx, txn, []string{req.GetName()}); err != nil {
+			return nil, err
+		}
+	}
 	docs, err := s.store.GetDocuments(ctx, []string{req.GetName()})
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkGet(ctx, []string{req.GetName()}, docs); err != nil {
 		return nil, err
 	}
 	doc, ok := docs[req.GetName()]
@@ -194,9 +229,17 @@ func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.F
 		newTxn = s.store.BeginTxn()
 		txnID = newTxn
 	}
+	if len(txnID) > 0 {
+		if err := s.store.LockTxnReads(stream.Context(), txnID, req.GetDocuments()); err != nil {
+			return err
+		}
+	}
 
 	docs, err := s.store.GetDocuments(stream.Context(), req.GetDocuments())
 	if err != nil {
+		return err
+	}
+	if err := s.checkGet(stream.Context(), req.GetDocuments(), docs); err != nil {
 		return err
 	}
 
@@ -241,24 +284,17 @@ func (s *Server) BatchGetDocuments(req *pb.BatchGetDocumentsRequest, stream pb.F
 // ListCollectionIds lists the collection ids under a parent, from the
 // registry maintained on write.
 func (s *Server) ListCollectionIds(ctx context.Context, req *pb.ListCollectionIdsRequest) (*pb.ListCollectionIdsResponse, error) {
-	rows, err := s.store.Pool.Query(ctx,
-		`SELECT collection_id FROM collections WHERE parent_path = $1 ORDER BY collection_id`, req.GetParent())
+	if err := adminOnly(ctx); err != nil {
+		return nil, err
+	}
+	ids, err := s.store.ListCollectionIDs(ctx, req.GetParent())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var resp pb.ListCollectionIdsResponse
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		resp.CollectionIds = append(resp.CollectionIds, id)
-	}
-	return &resp, rows.Err()
+	return &pb.ListCollectionIdsResponse{CollectionIds: ids}, nil
 }
 
-func docProto(doc *store.Doc) (*pb.Document, error) {
+func docProto(doc *backend.Doc) (*pb.Document, error) {
 	fields := doc.Fields
 	if fields == nil {
 		fields = map[string]*pb.Value{}
